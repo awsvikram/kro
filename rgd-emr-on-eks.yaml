@@ -1,0 +1,199 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: emr-on-eks.kro.run
+spec:
+  # -----------------------------------------------------------------------
+  # Schema: defines the custom API that users will instantiate (the RI)
+  # -----------------------------------------------------------------------
+  schema:
+    apiVersion: v1alpha1
+    kind: EMRonEKS
+    spec:
+      # --- Identity ---
+      name: string | required=true description="Base name used for all resources"
+
+      # --- EMR Virtual Cluster ---
+      eksClusterName: string | default="my-cluster"   description="Target EKS cluster name"
+      emrNamespace: string | default="emr-eks"        description="Namespace mapped to the EMR virtual cluster"
+      emrReleaseLabel: string | default="emr-6.15.0-latest" description="EMR release label"
+
+      # --- Job Execution ---
+      executionRoleARN: string | required=true description="IAM role ARN for Spark job execution (IRSA)"
+      jobEntryPoint: string | default="local:///usr/lib/spark/examples/src/main/python/pi.py" description="Spark job entry point"
+      jobEntryPointArguments: string | default=""   description="Extra arguments passed to the entry point"
+      sparkSubmitParameters: string | default="--conf spark.executor.instances=2 --conf spark.executor.memory=1G --conf spark.executor.cores=1 --conf spark.driver.cores=1" description="spark-submit parameters"
+
+      # --- Sample workload Deployment ---
+      sampleImage: string | default="public.ecr.aws/docker/library/python:3.11-slim" description="Container image for the sample deployment"
+      sampleReplicas: integer | default=1
+
+    status:
+      virtualClusterID: ${virtualCluster.status.id}
+      virtualClusterARN: ${virtualCluster.status.ackResourceMetadata.arn}
+      jobRunID: ${sparkJob.status.id}
+      jobRunState: ${sparkJob.status.state}
+
+  # -----------------------------------------------------------------------
+  # Resources: ordered graph that kro will create / reconcile
+  # -----------------------------------------------------------------------
+  resources:
+
+    # 1. ── Namespace for EMR on EKS ───────────────────────────────────────
+    #    kro creates this first; VirtualCluster depends on it existing.
+    - id: emrNamespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: ${schema.spec.emrNamespace}
+          labels:
+            app.kubernetes.io/managed-by: kro
+            emr-containers.amazonaws.com/virtual-cluster-name: ${schema.spec.name}
+
+    # 2. ── RBAC: allow EMR service to manage pods in the namespace ─────────
+    - id: emrClusterRole
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: emr-containers
+          namespace: ${emrNamespace.metadata.name}
+        rules:
+          - apiGroups: [""]
+            resources: [pods, services, configmaps, events, persistentvolumeclaims]
+            verbs: [get, list, watch, create, update, patch, delete]
+          - apiGroups: ["apps"]
+            resources: [statefulsets]
+            verbs: [get, list, watch, create, update, patch, delete]
+          - apiGroups: ["batch"]
+            resources: [jobs]
+            verbs: [get, list, watch, create, update, patch, delete]
+          - apiGroups: ["extensions", "networking.k8s.io"]
+            resources: [ingresses]
+            verbs: [get, list, watch, create, update, patch, delete]
+          - apiGroups: ["storage.k8s.io"]
+            resources: [storageclasses]
+            verbs: [get, list, watch]
+
+    - id: emrClusterRoleBinding
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: emr-containers
+          namespace: ${emrNamespace.metadata.name}
+        subjects:
+          - kind: User
+            name: emr-containers
+            apiGroup: rbac.authorization.k8s.io
+        roleRef:
+          kind: Role
+          name: ${emrClusterRole.metadata.name}
+          apiGroup: rbac.authorization.k8s.io
+
+    # 3. ── ACK VirtualCluster ─────────────────────────────────────────────
+    #    Depends implicitly on the Namespace and RBAC above via CEL refs.
+    - id: virtualCluster
+      template:
+        apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+        kind: VirtualCluster
+        metadata:
+          name: ${schema.spec.name}-vc
+          labels:
+            app.kubernetes.io/managed-by: kro
+        spec:
+          name: ${schema.spec.name}-vc
+          containerProvider:
+            id: ${schema.spec.eksClusterName}   # EKS cluster name
+            type_: EKS
+            info:
+              eksInfo:
+                namespace: ${emrNamespace.metadata.name}
+
+    # 4. ── ACK JobRun (sample Spark Pi job) ──────────────────────────────
+    #    Depends on virtualCluster; kro resolves this automatically.
+    - id: sparkJob
+      template:
+        apiVersion: emrcontainers.services.k8s.aws/v1alpha1
+        kind: JobRun
+        metadata:
+          name: ${schema.spec.name}-pi-job
+          labels:
+            app.kubernetes.io/managed-by: kro
+        spec:
+          name: ${schema.spec.name}-pi-job
+          virtualClusterRef:
+            from:
+              name: ${virtualCluster.metadata.name}   # resolved from resource above
+          executionRoleARN: ${schema.spec.executionRoleARN}
+          releaseLabel: ${schema.spec.emrReleaseLabel}
+          jobDriver:
+            sparkSubmitJobDriver:
+              entryPoint: ${schema.spec.jobEntryPoint}
+              entryPointArguments: ${schema.spec.jobEntryPointArguments}
+              sparkSubmitParameters: ${schema.spec.sparkSubmitParameters}
+          configurationOverrides: |
+            ApplicationConfiguration: null
+            MonitoringConfiguration:
+              PersistentAppUI: ENABLED
+
+    # 5. ── Sample workload Deployment in the EMR namespace ───────────────
+    #    A minimal Python HTTP server to validate the namespace is healthy.
+    - id: sampleDeployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${schema.spec.name}-sample-app
+          namespace: ${emrNamespace.metadata.name}
+          labels:
+            app: ${schema.spec.name}-sample-app
+            app.kubernetes.io/managed-by: kro
+        spec:
+          replicas: ${schema.spec.sampleReplicas}
+          selector:
+            matchLabels:
+              app: ${schema.spec.name}-sample-app
+          template:
+            metadata:
+              labels:
+                app: ${schema.spec.name}-sample-app
+            spec:
+              containers:
+                - name: sample-app
+                  image: ${schema.spec.sampleImage}
+                  command: ["python3", "-m", "http.server", "8080"]
+                  ports:
+                    - containerPort: 8080
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "128Mi"
+                    limits:
+                      cpu: "250m"
+                      memory: "256Mi"
+                  readinessProbe:
+                    tcpSocket:
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 10
+
+    # 6. ── Service for the sample Deployment ─────────────────────────────
+    - id: sampleService
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${schema.spec.name}-sample-svc
+          namespace: ${emrNamespace.metadata.name}
+          labels:
+            app.kubernetes.io/managed-by: kro
+        spec:
+          selector:
+            app: ${sampleDeployment.spec.selector.matchLabels.app}
+          ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8080
+          type: ClusterIP
