@@ -1,0 +1,38 @@
+apiVersion: kro.run/v1alpha1
+kind: EMRonEKS
+metadata:
+  name: my-emr-cluster
+  namespace: default        # namespace where the RI lives (kro watches here)
+spec:
+  # ── Identity ──────────────────────────────────────────────────────────
+  name: my-emr-cluster
+
+  # ── EMR Virtual Cluster ───────────────────────────────────────────────
+  # Points at the existing EKS cluster "my-cluster" and the namespace
+  # "emr-eks" that will be created and bound to the virtual cluster.
+  eksClusterName: my-cluster
+  emrNamespace: emr-eks
+  emrReleaseLabel: "emr-6.15.0-latest"
+
+  # ── Job Execution IAM Role ────────────────────────────────────────────
+  # This role must:
+  #   1. Have a trust policy allowing emr-containers.amazonaws.com
+  #   2. Have been updated via:
+  #      aws emr-containers update-role-trust-policy \
+  #        --cluster-name my-cluster \
+  #        --namespace emr-eks \
+  #        --role-name <role-name>
+  executionRoleARN: "arn:aws:iam::123456789012:role/EMRonEKS-JobExecutionRole"
+
+  # ── Spark Job (simple Pi calculation) ────────────────────────────────
+  jobEntryPoint: "local:///usr/lib/spark/examples/src/main/python/pi.py"
+  jobEntryPointArguments: ""
+  sparkSubmitParameters: >-
+    --conf spark.executor.instances=2
+    --conf spark.executor.memory=1G
+    --conf spark.executor.cores=1
+    --conf spark.driver.cores=1
+
+  # ── Sample Deployment ─────────────────────────────────────────────────
+  sampleImage: "public.ecr.aws/docker/library/python:3.11-slim"
+  sampleReplicas: 1
